@@ -1,12 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-scikit-learn
-opencv-python-headless
+onnxruntime
 numpy
-matplotlib
-streamlit
+opencv-python-headless
 pillow
-hdf5storage
-h5py
 flask
+matplotlib

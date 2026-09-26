@@ -3,10 +3,7 @@
   "builds": [
     {
       "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": {
-        "excludeFiles": "{.git/**,screenshots/**,brain_tumor_segmentation.ipynb,model.onnx,brain_tumor_dataset/**}"
-      }
+      "use": "@vercel/python"
     }
   ],
   "routes": [

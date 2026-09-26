@@ -8,27 +8,98 @@ import cv2
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 
-# Add project root directory to python path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
 
-from model import UNet, predict_mri_image, load_or_create_model, get_device
+# Add project root directory to python path
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 app = Flask(__name__)
 handler = app # Top-level export for Vercel deployment handler compatibility
 
-# Load model weights on startup
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ONNX_PATH = os.path.join(PROJECT_ROOT, "model.onnx")
 WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "model_best_checkpoint.pth")
 SAMPLES_DIR = os.path.join(PROJECT_ROOT, "samples")
 
-_cached_model = None
+_cached_ort_session = None
 
-def get_model():
-    global _cached_model
-    if _cached_model is None:
-        device = get_device()
-        _cached_model = load_or_create_model(weights_path=WEIGHTS_PATH, device=device)
-    return _cached_model
+def get_ort_session():
+    global _cached_ort_session
+    if _cached_ort_session is None and ort is not None:
+        if os.path.exists(ONNX_PATH):
+            _cached_ort_session = ort.InferenceSession(ONNX_PATH, providers=['CPUExecutionProvider'])
+    return _cached_ort_session
+
+def predict_mri_onnx(image_input, threshold=0.35):
+    """Runs high-performance U-Net inference using ONNX Runtime without PyTorch dependency."""
+    if isinstance(image_input, str):
+        img_np = np.array(Image.open(image_input).convert('L'))
+    elif isinstance(image_input, Image.Image):
+        img_np = np.array(image_input.convert('L'))
+    elif isinstance(image_input, np.ndarray):
+        if image_input.ndim == 3:
+            if image_input.shape[2] == 4:
+                img_np = cv2.cvtColor(image_input, cv2.COLOR_RGBA2GRAY)
+            elif image_input.shape[2] == 3:
+                img_np = cv2.cvtColor(image_input, cv2.COLOR_RGB2GRAY)
+            else:
+                img_np = image_input[:, :, 0]
+        else:
+            img_np = image_input
+    else:
+        raise ValueError("Unsupported image input type")
+
+    orig_shape = img_np.shape
+    resized_gray = cv2.resize(img_np, (128, 128), interpolation=cv2.INTER_AREA)
+
+    norm_img = resized_gray.astype(np.float32)
+    if norm_img.max() > 1.0:
+        norm_img /= 255.0
+
+    tensor = np.expand_dims(np.expand_dims(norm_img, 0), 0) # (1, 1, 128, 128)
+
+    session = get_ort_session()
+    if session is not None:
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+        prob_map = session.run([output_name], {input_name: tensor})[0][0, 0]
+    else:
+        # Fallback to PyTorch model if available
+        try:
+            from model import predict_mri_image
+            return predict_mri_image(image_input, threshold=threshold)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load ONNX or PyTorch model: {e}")
+
+    binary_mask = (prob_map >= threshold).astype(np.uint8)
+    pixel_count = int(np.sum(binary_mask))
+    total_pixels = prob_map.size
+    area_percentage = float((pixel_count / total_pixels) * 100.0)
+
+    has_tumor = pixel_count >= 15
+    max_confidence = float(np.max(prob_map)) if has_tumor else float(np.mean(prob_map))
+
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bounding_boxes = []
+    if has_tumor and contours:
+        for c in contours:
+            if cv2.contourArea(c) >= 7.5:
+                x, y, w, h = cv2.boundingRect(c)
+                bounding_boxes.append({"x": int(x), "y": int(y), "width": int(w), "height": int(h)})
+
+    return {
+        "has_tumor": has_tumor,
+        "confidence": max_confidence,
+        "area_percentage": area_percentage,
+        "pixel_count": pixel_count,
+        "bounding_boxes": bounding_boxes,
+        "binary_mask_128": binary_mask,
+        "resized_gray": resized_gray,
+        "orig_shape": orig_shape
+    }
 
 def image_to_base64(img_np_or_pil, format="PNG"):
     if isinstance(img_np_or_pil, np.ndarray):
@@ -137,7 +208,6 @@ HTML_TEMPLATE = """
             border-radius: 16px;
             padding: 1.5rem;
             backdrop-filter: blur(10px);
-
         }
 
         .sidebar h2 {
@@ -267,7 +337,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="header">
         <h1>🧠 Brain Tumor Detection & U-Net Segmentation</h1>
-        <p>PyTorch Deep Learning Clinical Decision Support System</p>
+        <p>ONNX Neural Network Clinical Decision Support System</p>
     </div>
 
     <div class="grid-container">
@@ -315,7 +385,7 @@ HTML_TEMPLATE = """
         <div class="main-content">
             <div id="statusBanner" class="status-banner"></div>
 
-            <div id="spinner" class="spinner">Analyzing MRI Scan with U-Net Neural Network...</div>
+            <div id="spinner" class="spinner">Analyzing MRI Scan with ONNX Neural Network...</div>
 
             <div id="resultsGrid" class="visual-grid" style="display:none;">
                 <div class="image-card">
@@ -447,7 +517,6 @@ def home():
 @app.route('/api/predict', methods=['POST'])
 def predict():
     try:
-        model = get_model()
         threshold = float(request.form.get('threshold', 0.35))
         opacity = float(request.form.get('opacity', 0.45))
         colormap = request.form.get('colormap', 'Jet')
@@ -469,7 +538,7 @@ def predict():
         if image_input is None:
             return jsonify({'error': 'No image input provided'}), 400
 
-        result = predict_mri_image(image_input, model=model, threshold=threshold)
+        result = predict_mri_onnx(image_input, threshold=threshold)
 
         has_tumor = result["has_tumor"]
         confidence = result["confidence"]
