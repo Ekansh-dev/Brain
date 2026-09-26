@@ -8,6 +8,13 @@ if hasattr(torch, 'classes') and not hasattr(torch.classes, '__path__'):
     except Exception:
         pass
 
+# Export top-level app and handler for Vercel Serverless Function compatibility
+try:
+    from api.index import app, handler
+except Exception:
+    app = None
+    handler = None
+
 import json
 import io
 import numpy as np
